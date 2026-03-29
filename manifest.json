@@ -1,0 +1,25 @@
+{
+  "name": "Smart Electricity Tracker",
+  "short_name": "Electricity",
+  "description": "Track electricity meter readings, usage analytics, bill estimates, and exports.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f3f7f6",
+  "theme_color": "#0f766e",
+  "icons": [
+    {
+      "src": "icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
