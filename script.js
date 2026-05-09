@@ -1,4 +1,5 @@
-const APP_VERSION = "1.1.1";
+const APP_VERSION = "1.1.2";
+
 
 
 const STORAGE_KEY = "smart-electricity-tracker-readings";
@@ -58,16 +59,16 @@ const chartState = {
 
 const SCANNER_CONFIG = {
   minDigits: 3,
-  preprocessScale: 2.4,
-  cropPaddingX: 0.08,
-  cropPaddingY: 0.18,
-  minConsensusMatches: 1,       // accept even a single-pass result
-  minAcceptedConfidence: 45,    // realistic Tesseract threshold for digit OCR
+  preprocessScale: 2.2,
+  cropPaddingX: 0.05,
+  cropPaddingY: 0.12,
+  minConsensusMatches: 1,
+  minAcceptedConfidence: 45,
   tesseractPasses: [
-    { id: "original",  label: "Original",  psm: 7 },  // single text line
-    { id: "contrast",  label: "Contrast",  psm: 8 },  // single word
-    { id: "adaptive",  label: "Adaptive",  psm: 6 },  // uniform block
-    { id: "sharpened", label: "Sharpened", psm: 13 }  // raw line, no layout
+    { id: "original",  label: "Original",  psm: 7 },
+    { id: "contrast",  label: "Contrast",  psm: 7 },
+    { id: "adaptive",  label: "Adaptive",  psm: 7 },
+    { id: "otsu",      label: "OTSU",      psm: 7 }
   ]
 };
 
@@ -1232,18 +1233,23 @@ function createGuideCropCanvas(sourceCanvas, frozenGuideRect) {
 
 function createOcrBaseCanvas(sourceCanvas) {
   const scaleFactor = SCANNER_CONFIG.preprocessScale;
-  const paddingX = Math.round(sourceCanvas.width * 0.12 * scaleFactor);
-  const paddingY = Math.round(sourceCanvas.height * 0.22 * scaleFactor);
-  const scaledWidth = Math.round(sourceCanvas.width * scaleFactor);
+  // Tight, fixed padding — large empty margins confuse Tesseract layout analysis
+  const paddingX = Math.round(sourceCanvas.width  * 0.04 * scaleFactor);
+  const paddingY = Math.round(sourceCanvas.height * 0.06 * scaleFactor);
+  const scaledWidth  = Math.round(sourceCanvas.width  * scaleFactor);
   const scaledHeight = Math.round(sourceCanvas.height * scaleFactor);
-  const canvas = createCanvas(scaledWidth + (paddingX * 2), scaledHeight + (paddingY * 2));
+  const canvas  = createCanvas(scaledWidth + (paddingX * 2), scaledHeight + (paddingY * 2));
   const context = canvas.getContext("2d");
 
   context.fillStyle = "#ffffff";
   context.fillRect(0, 0, canvas.width, canvas.height);
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
-  context.drawImage(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, paddingX, paddingY, scaledWidth, scaledHeight);
+  context.imageSmoothingEnabled  = true;
+  context.imageSmoothingQuality  = "high";
+  context.drawImage(
+    sourceCanvas,
+    0, 0, sourceCanvas.width, sourceCanvas.height,
+    paddingX, paddingY, scaledWidth, scaledHeight
+  );
 
   return canvas;
 }
@@ -1364,6 +1370,39 @@ function applySharpenToGrayscale(pixels, width, height) {
   return sharpened;
 }
 
+// OTSU global threshold — finds the optimal separation between
+// digit pixels and background via inter-class variance maximisation.
+// Works very well for LCD / 7-segment displays with clear contrast.
+function applyOtsuThreshold(pixels, width, height) {
+  const histogram = buildHistogram(pixels);
+  const total = pixels.length;
+  let sum = 0;
+
+  for (let i = 0; i < 256; i++) {
+    sum += i * histogram[i];
+  }
+
+  let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+
+  for (let t = 0; t < 256; t++) {
+    wB += histogram[t];
+    if (!wB) continue;
+    const wF = total - wB;
+    if (!wF) break;
+    sumB += t * histogram[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const variance = wB * wF * (mB - mF) ** 2;
+    if (variance > maxVar) { maxVar = variance; threshold = t; }
+  }
+
+  const result = new Uint8ClampedArray(pixels.length);
+  for (let i = 0; i < pixels.length; i++) {
+    result[i] = pixels[i] <= threshold ? 0 : 255;
+  }
+  return ensureLightBackground(result, width, height);
+}
+
 function applyAdaptiveThreshold(pixels, width, height) {
   const radius = Math.max(12, Math.round(Math.min(width, height) * 0.08));
   const bias = 10;
@@ -1422,8 +1461,10 @@ function createCanvasFromGrayscale(pixels, width, height) {
 
 function buildOcrVariants(sourceCanvas) {
   const baseCanvas = createOcrBaseCanvas(sourceCanvas);
-  const context = baseCanvas.getContext("2d", { willReadFrequently: true });
-  const imageData = context.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
+  const context    = baseCanvas.getContext("2d", { willReadFrequently: true });
+  const imageData  = context.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
+
+  // Normalised grayscale with light background guaranteed
   const normalizedGrayscale = ensureLightBackground(
     applyLevels(extractGrayscalePixels(imageData), {
       blackPointPercentile: 0.01,
@@ -1433,33 +1474,28 @@ function buildOcrVariants(sourceCanvas) {
     baseCanvas.width,
     baseCanvas.height
   );
+
+  // High-contrast levelled version — base for binarization passes
   const contrastPixels = applyContrastBoost(
     applyLevels(normalizedGrayscale, {
       blackPointPercentile: 0.02,
       whitePointPercentile: 0.985,
-      gamma: 0.92
+      gamma: 0.88   // slightly darker to make digits bold
     }),
-    1.36
+    1.5           // stronger contrast boost
   );
+
+  // Adaptive threshold — handles uneven lighting across the meter face
   const adaptivePixels = applyAdaptiveThreshold(contrastPixels, baseCanvas.width, baseCanvas.height);
-  const sharpenedPixels = ensureLightBackground(
-    applyLevels(
-      applySharpenToGrayscale(contrastPixels, baseCanvas.width, baseCanvas.height),
-      {
-        blackPointPercentile: 0.02,
-        whitePointPercentile: 0.99,
-        gamma: 0.94
-      }
-    ),
-    baseCanvas.width,
-    baseCanvas.height
-  );
+
+  // OTSU global threshold — best for high-contrast LCD / 7-segment displays
+  const otsuPixels = applyOtsuThreshold(normalizedGrayscale, baseCanvas.width, baseCanvas.height);
 
   return [
     { id: "original", label: "Original", canvas: cloneCanvas(baseCanvas) },
-    { id: "contrast", label: "Contrast", canvas: createCanvasFromGrayscale(contrastPixels, baseCanvas.width, baseCanvas.height) },
-    { id: "adaptive", label: "Adaptive", canvas: createCanvasFromGrayscale(adaptivePixels, baseCanvas.width, baseCanvas.height) },
-    { id: "sharpened", label: "Sharpened", canvas: createCanvasFromGrayscale(sharpenedPixels, baseCanvas.width, baseCanvas.height) }
+    { id: "contrast",  label: "Contrast",  canvas: createCanvasFromGrayscale(contrastPixels, baseCanvas.width, baseCanvas.height) },
+    { id: "adaptive",  label: "Adaptive",  canvas: createCanvasFromGrayscale(adaptivePixels, baseCanvas.width, baseCanvas.height) },
+    { id: "otsu",      label: "OTSU",      canvas: createCanvasFromGrayscale(otsuPixels,     baseCanvas.width, baseCanvas.height) }
   ];
 }
 
@@ -1525,15 +1561,14 @@ async function getOcrWorker() {
     }
   });
 
-  // Base parameters shared across all passes.
-  // PSM will be overridden per-pass in runTesseractPasses.
+  // PSM 7 = single text line, best for meter digit sequences.
+  // DPI 70 matches the actual rendered px-per-inch of the upscaled crop canvas.
   await scannerState.worker.setParameters({
     tessedit_char_whitelist: "0123456789",
     tessedit_pageseg_mode: 7,
     preserve_interword_spaces: 0,
     classify_bln_numeric_mode: 1,
-    textord_min_linesize: 1.5,
-    user_defined_dpi: "150"
+    user_defined_dpi: "70"
   });
 
   return scannerState.worker;
@@ -1817,22 +1852,12 @@ async function runMlEnhancedOcr(capturedCanvas, scanToken) {
       setScannerMessage("Quality OK. Enhancing image with AI...");
     }
 
-    // ── Stage 2: TF.js unsharp-mask preprocessing ─────────────────────────
-    let enhancedCanvas = capturedCanvas;
-
-    if (isTfAvailable() && mlState.tfReady) {
-      setScannerMessage("AI sharpening image...");
-      enhancedCanvas = await applyTfEnhancement(capturedCanvas);
-      mlState.tfUsedInLastScan = true;
-    }
-
-    if (scanToken !== scannerState.scanToken) {
-      return;
-    }
-
-    // ── Stage 3: Multi-pass Tesseract OCR on enhanced image ───────────────
+    // ── Stage 2: skip TF enhancement — Gaussian blur before Tesseract
+    // blurs digit edges and hurts accuracy. TF.js is used only for
+    // the quality gate above.
+    // ── Stage 3: Multi-pass Tesseract OCR on the raw cropped image ────────
     setScannerMessage("Running ensemble OCR passes...");
-    const variants = buildOcrVariants(enhancedCanvas);
+    const variants = buildOcrVariants(capturedCanvas);
 
     if (scanToken !== scannerState.scanToken) {
       return;
