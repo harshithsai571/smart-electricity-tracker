@@ -59,14 +59,14 @@ const SCANNER_CONFIG = {
   minDigits: 3,
   preprocessScale: 2.4,
   cropPaddingX: 0.08,
-  cropPaddingY: 0.2,
-  minConsensusMatches: 2,
-  minAcceptedConfidence: 72,
+  cropPaddingY: 0.18,
+  minConsensusMatches: 1,       // accept even a single-pass result
+  minAcceptedConfidence: 45,    // realistic Tesseract threshold for digit OCR
   tesseractPasses: [
-    { id: "original", label: "Original" },
-    { id: "contrast", label: "Contrast" },
-    { id: "adaptive", label: "Adaptive" },
-    { id: "sharpened", label: "Sharpened" }
+    { id: "original",  label: "Original",  psm: 7 },  // single text line
+    { id: "contrast",  label: "Contrast",  psm: 8 },  // single word
+    { id: "adaptive",  label: "Adaptive",  psm: 6 },  // uniform block
+    { id: "sharpened", label: "Sharpened", psm: 13 }  // raw line, no layout
   ]
 };
 
@@ -795,8 +795,8 @@ async function applyTfEnhancement(canvas) {
     const blurred = tf.conv2d(float, gaussKernel, 1, "same");
     tensors.push(blurred);
 
-    // Unsharp mask: original + 1.8 × (original - blurred)
-    const sharpened = float.add(float.sub(blurred).mul(1.8));
+    // Unsharp mask: 0.9× strength avoids ringing on digit edges
+    const sharpened = float.add(float.sub(blurred).mul(0.9));
     tensors.push(sharpened);
     const clipped = sharpened.clipByValue(0, 1);
     tensors.push(clipped);
@@ -1524,12 +1524,15 @@ async function getOcrWorker() {
     }
   });
 
+  // Base parameters shared across all passes.
+  // PSM will be overridden per-pass in runTesseractPasses.
   await scannerState.worker.setParameters({
     tessedit_char_whitelist: "0123456789",
     tessedit_pageseg_mode: 7,
     preserve_interword_spaces: 0,
     classify_bln_numeric_mode: 1,
-    user_defined_dpi: "300"
+    textord_min_linesize: 1.5,
+    user_defined_dpi: "150"
   });
 
   return scannerState.worker;
@@ -1575,6 +1578,15 @@ async function runTesseractPasses(variants, scanToken) {
 
     scannerState.activePassLabel = `${pass.label} pass`;
     setScannerMessage(`Running ${pass.label.toLowerCase()} OCR pass...`);
+
+    // Override PSM per pass so each variant tries a different segmentation
+    // mode — this is the main way to recover from Tesseract refusing to
+    // segment a particular image layout.
+    if (pass.psm !== undefined) {
+      try {
+        await worker.setParameters({ tessedit_pageseg_mode: pass.psm });
+      } catch (_e) { /* ignore — worker keeps previous PSM */ }
+    }
 
     const result = await worker.recognize(variant.canvas);
 
@@ -1622,17 +1634,39 @@ function runFallbackOcrPass(variants) {
 }
 
 function chooseBestOcrResult(candidates) {
-  const usableCandidates = candidates.filter((candidate) => candidate.text);
+  const usableCandidates = candidates.filter((c) => c.text && c.text.length >= SCANNER_CONFIG.minDigits);
 
   if (usableCandidates.length === 0) {
+    // Try with any non-empty text as a last resort
+    const anyCandidates = candidates.filter((c) => c.text);
+    if (anyCandidates.length === 0) {
+      return { accepted: false, confidence: 0, bestCandidate: null, bestText: "" };
+    }
+    const best = anyCandidates.sort((a, b) => b.confidence - a.confidence)[0];
+    return { accepted: false, confidence: best.confidence, bestCandidate: best, bestText: best.text };
+  }
+
+  // ── Plausibility fast-path ────────────────────────────────────────────────
+  // If any single pass returned a confident, plausible digit string (4-8 digits)
+  // that is all-numeric and reasonably long, accept it immediately without
+  // requiring multi-pass consensus.  This covers the common case where the
+  // image is clear but Tesseract variants disagree by just 1 digit.
+  const plausibleLength = (t) => t.length >= 4 && t.length <= 8;
+  const strongSingle = usableCandidates
+    .filter((c) => c.confidence >= 65 && plausibleLength(c.text))
+    .sort((a, b) => (b.confidence + b.text.length * 4) - (a.confidence + a.text.length * 4))[0];
+
+  if (strongSingle) {
+    const fastConfidence = clamp(Math.round(strongSingle.confidence * 0.8 + strongSingle.text.length * 2), 0, 99);
     return {
-      accepted: false,
-      confidence: 0,
-      bestCandidate: null,
-      bestText: ""
+      accepted: fastConfidence >= SCANNER_CONFIG.minAcceptedConfidence,
+      confidence: fastConfidence,
+      bestCandidate: strongSingle,
+      bestText: strongSingle.text
     };
   }
 
+  // ── Group by identical text across passes ─────────────────────────────────
   const groupedCandidates = usableCandidates.reduce((groups, candidate) => {
     const group = groups.get(candidate.text) || {
       text: candidate.text,
@@ -1675,49 +1709,43 @@ function chooseBestOcrResult(candidates) {
         (group.bestConfidence * 0.12) +
         (group.weightedScore * 0.1);
 
-      return {
-        ...group,
-        averageConfidence,
-        finalScore
-      };
+      return { ...group, averageConfidence, finalScore };
     })
     .sort((left, right) => {
-      if (right.finalScore !== left.finalScore) {
-        return right.finalScore - left.finalScore;
-      }
-
-      if (right.count !== left.count) {
-        return right.count - left.count;
-      }
-
-      if (right.text.length !== left.text.length) {
-        return right.text.length - left.text.length;
-      }
-
+      if (right.finalScore !== left.finalScore) return right.finalScore - left.finalScore;
+      if (right.count !== left.count)           return right.count - left.count;
+      if (right.text.length !== left.text.length) return right.text.length - left.text.length;
       return right.bestConfidence - left.bestConfidence;
     });
 
   const bestGroup = rankedGroups[0];
-  const runnerUp = rankedGroups[1];
+  const runnerUp  = rankedGroups[1];
   const consensusRatio = bestGroup.count / usableCandidates.length;
+
+  // Confidence: weighted blend of Tesseract score + consensus bonus
   const confidence = clamp(
     Math.round(
-      (bestGroup.averageConfidence * 0.46) +
-      (bestGroup.bestConfidence * 0.18) +
-      (consensusRatio * 100 * 0.22) +
-      (bestGroup.engineSet.size > 1 ? 10 : 0) +
-      Math.min(12, bestGroup.text.length * 2)
+      (bestGroup.averageConfidence * 0.50) +
+      (bestGroup.bestConfidence   * 0.15) +
+      (consensusRatio * 100       * 0.20) +
+      (bestGroup.engineSet.size > 1 ? 8 : 0) +
+      Math.min(14, bestGroup.text.length * 2.5)
     ),
     0,
     99
   );
+
+  // Accept if: enough digits AND (at least 1 pass agrees OR confidence OK)
   const consistentEnough =
     bestGroup.count >= SCANNER_CONFIG.minConsensusMatches ||
-    (bestGroup.engineSet.size > 1 && consensusRatio >= 0.4);
+    (bestGroup.engineSet.size > 1 && consensusRatio >= 0.3);
+
+  // Separation: skip when there is clearly only one candidate
   const separatedEnough =
     !runnerUp ||
     bestGroup.count > runnerUp.count ||
-    (bestGroup.finalScore - runnerUp.finalScore) >= 12;
+    (bestGroup.finalScore - runnerUp.finalScore) >= 8;
+
   const accepted =
     bestGroup.text.length >= SCANNER_CONFIG.minDigits &&
     consistentEnough &&
