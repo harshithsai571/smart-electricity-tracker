@@ -1142,87 +1142,89 @@ function getDisplayedVideoRegion() {
     return null;
   }
 
-  const elementAspectRatio = elementWidth / elementHeight;
-  const videoAspectRatio = videoWidth / videoHeight;
-  let drawWidth = elementWidth;
-  let drawHeight = elementHeight;
-  let offsetX = 0;
-  let offsetY = 0;
+  // The video element uses object-fit: cover, which means the video is
+  // uniformly scaled so BOTH dimensions are >= the element dimensions.
+  // The larger scale wins, and the overflow is cropped symmetrically.
+  const scaleToFillWidth  = elementWidth  / videoWidth;
+  const scaleToFillHeight = elementHeight / videoHeight;
+  const coverScale = Math.max(scaleToFillWidth, scaleToFillHeight);
 
-  if (videoAspectRatio > elementAspectRatio) {
-    drawWidth = elementHeight * videoAspectRatio;
-    offsetX = (elementWidth - drawWidth) / 2;
-  } else {
-    drawHeight = elementWidth / videoAspectRatio;
-    offsetY = (elementHeight - drawHeight) / 2;
-  }
+  // Rendered video size in CSS pixels (one axis will equal the element, the
+  // other will overflow and be clipped).
+  const drawWidth  = videoWidth  * coverScale;
+  const drawHeight = videoHeight * coverScale;
 
-  return { drawWidth, drawHeight, offsetX, offsetY };
+  // How far the rendered video extends BEYOND the element's top-left corner
+  // (always <= 0 for the clipped axis, 0 for the filled axis).
+  const offsetX = (elementWidth  - drawWidth)  / 2;  // negative when wider
+  const offsetY = (elementHeight - drawHeight) / 2;  // negative when taller
+
+  return { drawWidth, drawHeight, offsetX, offsetY, coverScale };
 }
 
-function createGuideCropCanvas(sourceCanvas) {
+function createGuideCropCanvas(sourceCanvas, frozenGuideRect) {
   const videoRegion = getDisplayedVideoRegion();
-  const videoRect = cameraPreview.getBoundingClientRect();
-  const guideRect = guideBox.getBoundingClientRect();
+  const videoRect   = cameraPreview.getBoundingClientRect();
+  // Use the frozen rect captured before any layout shifts, or fall back to live.
+  const guideRect   = frozenGuideRect || guideBox.getBoundingClientRect();
 
   if (!videoRegion || !videoRect.width || !guideRect.width || !guideRect.height) {
-    const fallbackWidth = Math.round(sourceCanvas.width * 0.64);
-    const fallbackHeight = Math.round(sourceCanvas.height * 0.24);
-    const fallbackX = Math.round(sourceCanvas.width * 0.18);
-    const fallbackY = Math.round(sourceCanvas.height * 0.38);
-    const fallbackCanvas = createCanvas(fallbackWidth, fallbackHeight);
-    const fallbackContext = fallbackCanvas.getContext("2d");
-
-    fallbackContext.drawImage(
+    // Fallback: crop the horizontal centre strip (64% wide, 24% tall)
+    const fw = Math.round(sourceCanvas.width  * 0.64);
+    const fh = Math.round(sourceCanvas.height * 0.24);
+    const fx = Math.round(sourceCanvas.width  * 0.18);
+    const fy = Math.round(sourceCanvas.height * 0.38);
+    const fc = createCanvas(fw, fh);
+    fc.getContext("2d").drawImage(
       sourceCanvas,
-      clamp(fallbackX, 0, sourceCanvas.width - 1),
-      clamp(fallbackY, 0, sourceCanvas.height - 1),
-      clamp(fallbackWidth, 1, sourceCanvas.width - fallbackX),
-      clamp(fallbackHeight, 1, sourceCanvas.height - fallbackY),
-      0,
-      0,
-      fallbackCanvas.width,
-      fallbackCanvas.height
+      clamp(fx, 0, sourceCanvas.width  - 1),
+      clamp(fy, 0, sourceCanvas.height - 1),
+      clamp(fw, 1, sourceCanvas.width  - fx),
+      clamp(fh, 1, sourceCanvas.height - fy),
+      0, 0, fc.width, fc.height
     );
-
-    return fallbackCanvas;
+    return fc;
   }
 
-  const scaleX = sourceCanvas.width / videoRegion.drawWidth;
-  const scaleY = sourceCanvas.height / videoRegion.drawHeight;
-  const relativeLeft = guideRect.left - videoRect.left - videoRegion.offsetX;
-  const relativeTop = guideRect.top - videoRect.top - videoRegion.offsetY;
-  const paddingX = guideRect.width * SCANNER_CONFIG.cropPaddingX * scaleX;
-  const paddingY = guideRect.height * SCANNER_CONFIG.cropPaddingY * scaleY;
+  // ── Convert guide-box screen coordinates → video pixel coordinates ──────
+  //
+  // coverScale converts video pixels → CSS pixels (object-fit: cover scale).
+  // Its inverse converts CSS pixels → video pixels.
+  const { offsetX, offsetY, coverScale } = videoRegion;
+
+  // Position of the guide box relative to the top-left of the *rendered*
+  // video content (which starts at videoRect.left + offsetX, videoRect.top + offsetY).
+  const relativeLeft = guideRect.left - (videoRect.left + offsetX);
+  const relativeTop  = guideRect.top  - (videoRect.top  + offsetY);
+
+  // Convert from CSS display pixels to video pixels.
+  const toVideoPixel = 1 / coverScale;
+
+  // Small padding (8% X, 10% Y) keeps digits from touching the crop edge.
+  const padX = guideRect.width  * SCANNER_CONFIG.cropPaddingX * toVideoPixel;
+  const padY = guideRect.height * SCANNER_CONFIG.cropPaddingY * toVideoPixel;
+
   const crop = {
-    x: Math.round((relativeLeft * scaleX) - paddingX),
-    y: Math.round((relativeTop * scaleY) - paddingY),
-    width: Math.round((guideRect.width * scaleX) + (paddingX * 2)),
-    height: Math.round((guideRect.height * scaleY) + (paddingY * 2))
+    x:      Math.round(relativeLeft * toVideoPixel - padX),
+    y:      Math.round(relativeTop  * toVideoPixel - padY),
+    width:  Math.round(guideRect.width  * toVideoPixel + padX * 2),
+    height: Math.round(guideRect.height * toVideoPixel + padY * 2)
   };
 
-  crop.x = clamp(crop.x, 0, sourceCanvas.width - 1);
-  crop.y = clamp(crop.y, 0, sourceCanvas.height - 1);
-  crop.width = clamp(crop.width, 1, sourceCanvas.width - crop.x);
+  crop.x      = clamp(crop.x,      0, sourceCanvas.width  - 1);
+  crop.y      = clamp(crop.y,      0, sourceCanvas.height - 1);
+  crop.width  = clamp(crop.width,  1, sourceCanvas.width  - crop.x);
   crop.height = clamp(crop.height, 1, sourceCanvas.height - crop.y);
 
-  const canvas = createCanvas(crop.width, crop.height);
+  const canvas  = createCanvas(crop.width, crop.height);
   const context = canvas.getContext("2d");
-
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
+  context.imageSmoothingEnabled  = true;
+  context.imageSmoothingQuality  = "high";
   context.drawImage(
     sourceCanvas,
-    crop.x,
-    crop.y,
-    crop.width,
-    crop.height,
-    0,
-    0,
-    canvas.width,
-    canvas.height
+    crop.x, crop.y, crop.width, crop.height,
+    0,      0,      canvas.width, canvas.height
   );
-
   return canvas;
 }
 
@@ -1862,6 +1864,11 @@ async function handleCapture() {
     return;
   }
 
+  // Snapshot the guide-box position FIRST, before anything changes the layout.
+  // hideQualityBadge() and stopCamera() can trigger reflows that shift the
+  // guide box, making its live getBoundingClientRect() stale at crop time.
+  const frozenGuideRect = guideBox.getBoundingClientRect();
+
   const fullFrameCanvas = createFullFrameCanvas();
 
   if (!fullFrameCanvas) {
@@ -1872,7 +1879,8 @@ async function handleCapture() {
   stopLiveQualityMonitor();
   hideQualityBadge();
 
-  const capturedCanvas = createGuideCropCanvas(fullFrameCanvas);
+  // Pass the frozen rect so the crop matches the frame the user just captured.
+  const capturedCanvas = createGuideCropCanvas(fullFrameCanvas, frozenGuideRect);
 
   capturePreview.src = fullFrameCanvas.toDataURL("image/jpeg", 0.95);
   stopCamera();
@@ -1880,6 +1888,7 @@ async function handleCapture() {
   setScannerPassSummary("Full-resolution frame captured. Running AI-enhanced OCR passes...");
   await runMlEnhancedOcr(capturedCanvas, scannerState.scanToken);
 }
+
 
 async function openScanner() {
   showScanner();
