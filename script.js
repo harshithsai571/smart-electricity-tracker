@@ -33,6 +33,8 @@ const retakeButton = document.getElementById("retake-button");
 const scannerStatusElement = document.getElementById("scanner-status");
 const scannerLoadingElement = document.getElementById("scanner-loading");
 const ocrResultElement = document.getElementById("ocr-result");
+const ocrConfidenceElement = document.getElementById("ocr-confidence");
+const scannerPassSummaryElement = document.getElementById("scanner-pass-summary");
 const guideBox = document.getElementById("guide-box");
 const cropPreview = document.getElementById("crop-preview");
 const updateModal = document.getElementById("update-modal");
@@ -40,17 +42,56 @@ const updateMessageElement = document.getElementById("update-message");
 const updateNowButton = document.getElementById("update-now-button");
 const updateLaterButton = document.getElementById("update-later-button");
 
+// ML / quality UI
+const aiModelStatusEl = document.getElementById("ai-model-status");
+const qualityBadgeWrap = document.getElementById("quality-badge-wrap");
+const qualityLabelEl = document.getElementById("quality-label");
+const blurScoreDetailEl = document.getElementById("blur-score-detail");
+const aiSourceBadgeEl = document.getElementById("ai-source-badge");
+
 const chartState = {
   mode: "week",
   animationFrame: null
+};
+
+const SCANNER_CONFIG = {
+  minDigits: 3,
+  preprocessScale: 2.4,
+  cropPaddingX: 0.08,
+  cropPaddingY: 0.2,
+  minConsensusMatches: 2,
+  minAcceptedConfidence: 72,
+  tesseractPasses: [
+    { id: "original", label: "Original" },
+    { id: "contrast", label: "Contrast" },
+    { id: "adaptive", label: "Adaptive" },
+    { id: "sharpened", label: "Sharpened" }
+  ]
+};
+
+const ML_CONFIG = {
+  blurThreshold: 3.2,      // Laplacian variance × 1500 — below = too blurry
+  glareThreshold: 22,       // % of pixels > 0.95 brightness — above = glare
+  qualityPollMs: 900,       // ms between live quality checks
+  sampleSize: 320           // downscale to this width for fast quality checks
+};
+
+const mlState = {
+  tfReady: false,
+  qualityLoopId: null,
+  lastQuality: null,
+  tfUsedInLastScan: false
 };
 
 const scannerState = {
   stream: null,
   worker: null,
   capturedReading: "",
+  capturedConfidence: 0,
   isProcessing: false,
-  scanToken: 0
+  scanToken: 0,
+  activePassLabel: "",
+  lastPassSummary: ""
 };
 
 function loadReadings() {
@@ -630,21 +671,265 @@ function handleChartToggle(event) {
   renderAnalytics(calculateReadings(loadReadings()));
 }
 
+// ─── TensorFlow.js ML layer ───────────────────────────────────────────────
+
+function isTfAvailable() {
+  return typeof window.tf !== "undefined";
+}
+
+async function warmUpTf() {
+  if (!isTfAvailable() || mlState.tfReady) {
+    return;
+  }
+
+  try {
+    await tf.ready();
+    const dummy = tf.zeros([1, 8, 8, 1]);
+    const kernel = tf.zeros([3, 3, 1, 1]);
+    const result = tf.conv2d(dummy, kernel, 1, "same");
+    result.dataSync();
+    tf.dispose([dummy, kernel, result]);
+    mlState.tfReady = true;
+  } catch (_error) {
+    mlState.tfReady = false;
+  }
+}
+
+async function assessImageQuality(sourceCanvas) {
+  if (!isTfAvailable()) {
+    return { blurScore: 50, glareScore: 0, isUsable: true, label: "OK", level: "good" };
+  }
+
+  // Downscale for speed
+  const scale = Math.min(1, ML_CONFIG.sampleSize / sourceCanvas.width);
+  const sw = Math.max(1, Math.round(sourceCanvas.width * scale));
+  const sh = Math.max(1, Math.round(sourceCanvas.height * scale));
+  const sampleCanvas = createCanvas(sw, sh);
+  sampleCanvas.getContext("2d").drawImage(sourceCanvas, 0, 0, sw, sh);
+
+  const tensors = [];
+  let blurScore = 50;
+  let glareScore = 0;
+
+  try {
+    const img = tf.browser.fromPixels(sampleCanvas, 1);
+    tensors.push(img);
+    const float = img.toFloat().div(255);
+    tensors.push(float);
+    const expanded = float.expandDims(0); // [1,H,W,1]
+    tensors.push(expanded);
+
+    // Laplacian kernel: measures sharpness via edge variance
+    const lapKernel = tf.tensor4d(
+      [0, 1, 0, 1, -4, 1, 0, 1, 0],
+      [3, 3, 1, 1]
+    );
+    tensors.push(lapKernel);
+    const laplacian = tf.conv2d(expanded, lapKernel, 1, "valid");
+    tensors.push(laplacian);
+    const variance = laplacian.square().mean();
+    tensors.push(variance);
+    blurScore = Math.min((await variance.data())[0] * 1500, 100);
+
+    // Glare: ratio of nearly-white pixels
+    const overexposed = float.greater(0.95);
+    tensors.push(overexposed);
+    const overCount = overexposed.sum();
+    tensors.push(overCount);
+    glareScore = ((await overCount.data())[0] / (sw * sh)) * 100;
+  } catch (_err) {
+    blurScore = 50;
+    glareScore = 0;
+  } finally {
+    tf.dispose(tensors);
+  }
+
+  let label;
+  let level;
+
+  if (glareScore >= ML_CONFIG.glareThreshold) {
+    label = "Glare detected";
+    level = "warn";
+  } else if (blurScore < ML_CONFIG.blurThreshold) {
+    label = "Too blurry";
+    level = "warn";
+  } else if (blurScore >= ML_CONFIG.blurThreshold * 2.2 && glareScore < ML_CONFIG.glareThreshold * 0.55) {
+    label = "Good quality";
+    level = "good";
+  } else {
+    label = "Acceptable";
+    level = "ok";
+  }
+
+  return {
+    blurScore,
+    glareScore,
+    isUsable: blurScore >= ML_CONFIG.blurThreshold && glareScore < ML_CONFIG.glareThreshold,
+    label,
+    level
+  };
+}
+
+async function applyTfEnhancement(canvas) {
+  if (!isTfAvailable()) {
+    return canvas;
+  }
+
+  const tensors = [];
+
+  try {
+    const img = tf.browser.fromPixels(canvas, 1);
+    tensors.push(img);
+    const float = img.toFloat().div(255).expandDims(0); // [1,H,W,1]
+    tensors.push(float);
+
+    // Gaussian blur for noise suppression
+    const gaussData = [
+      1 / 16, 2 / 16, 1 / 16,
+      2 / 16, 4 / 16, 2 / 16,
+      1 / 16, 2 / 16, 1 / 16
+    ];
+    const gaussKernel = tf.tensor4d(gaussData, [3, 3, 1, 1]);
+    tensors.push(gaussKernel);
+    const blurred = tf.conv2d(float, gaussKernel, 1, "same");
+    tensors.push(blurred);
+
+    // Unsharp mask: original + 1.8 × (original - blurred)
+    const sharpened = float.add(float.sub(blurred).mul(1.8));
+    tensors.push(sharpened);
+    const clipped = sharpened.clipByValue(0, 1);
+    tensors.push(clipped);
+
+    // [1,H,W,1] → [H,W,1] → [H,W,3] for toPixels
+    const squeezed = clipped.squeeze([0]);
+    tensors.push(squeezed);
+    const rgb = squeezed.tile([1, 1, 3]);
+    tensors.push(rgb);
+
+    const outCanvas = document.createElement("canvas");
+    outCanvas.width = canvas.width;
+    outCanvas.height = canvas.height;
+    await tf.browser.toPixels(rgb, outCanvas);
+    return outCanvas;
+  } catch (_err) {
+    return canvas;
+  } finally {
+    tf.dispose(tensors);
+  }
+}
+
+function updateQualityBadge(quality) {
+  mlState.lastQuality = quality;
+  qualityBadgeWrap.classList.remove("is-hidden");
+  qualityBadgeWrap.dataset.level = quality.level;
+  qualityLabelEl.textContent = quality.label;
+  blurScoreDetailEl.textContent =
+    quality.blurScore !== undefined
+      ? `sharpness ${quality.blurScore.toFixed(1)}`
+      : "";
+}
+
+function hideQualityBadge() {
+  qualityBadgeWrap.classList.add("is-hidden");
+  mlState.lastQuality = null;
+}
+
+async function runQualityCheck() {
+  if (!scannerState.stream || !cameraPreview.videoWidth) {
+    return;
+  }
+
+  const tmpCanvas = createCanvas(
+    cameraPreview.videoWidth,
+    cameraPreview.videoHeight
+  );
+  tmpCanvas.getContext("2d").drawImage(cameraPreview, 0, 0);
+  const quality = await assessImageQuality(tmpCanvas);
+  updateQualityBadge(quality);
+}
+
+function startLiveQualityMonitor() {
+  stopLiveQualityMonitor();
+
+  async function loop() {
+    await runQualityCheck();
+    mlState.qualityLoopId = setTimeout(loop, ML_CONFIG.qualityPollMs);
+  }
+
+  mlState.qualityLoopId = setTimeout(loop, 600);
+}
+
+function stopLiveQualityMonitor() {
+  if (mlState.qualityLoopId !== null) {
+    clearTimeout(mlState.qualityLoopId);
+    mlState.qualityLoopId = null;
+  }
+}
+
+function showAiModelStatus(state) {
+  aiModelStatusEl.className = `ai-model-badge ai-model-badge--${state}`;
+  aiModelStatusEl.textContent = state === "loading" ? "AI Loading\u2026" : "AI Ready";
+  aiModelStatusEl.classList.remove("is-hidden");
+
+  if (state === "ready") {
+    setTimeout(() => aiModelStatusEl.classList.add("is-hidden"), 2800);
+  }
+}
+
+function hideAiModelStatus() {
+  aiModelStatusEl.classList.add("is-hidden");
+}
+
+function setAiSourceBadge(visible) {
+  aiSourceBadgeEl.classList.toggle("is-hidden", !visible);
+}
+
+// ─── End of ML layer ──────────────────────────────────────────────────────
+
 function setScannerMessage(text) {
   scannerStatusElement.textContent = text;
+}
+
+function getConfidenceMeta(score) {
+  if (!score) {
+    return { label: "--", level: "idle" };
+  }
+
+  if (score >= 85) {
+    return { label: `High ${score}%`, level: "high" };
+  }
+
+  if (score >= 65) {
+    return { label: `Medium ${score}%`, level: "medium" };
+  }
+
+  return { label: `Low ${score}%`, level: "low" };
+}
+
+function setConfidenceIndicator(score = 0) {
+  const { label, level } = getConfidenceMeta(score);
+  ocrConfidenceElement.textContent = `Confidence: ${label}`;
+  ocrConfidenceElement.dataset.level = level;
+}
+
+function setScannerPassSummary(text = "Capture a clear frame to start multi-pass scanning.") {
+  scannerState.lastPassSummary = text;
+  scannerPassSummaryElement.textContent = text;
 }
 
 function setScannerLoading(isLoading) {
   scannerState.isProcessing = isLoading;
   scannerLoadingElement.classList.toggle("is-hidden", !isLoading);
   captureButton.disabled = isLoading || !scannerState.stream;
-  retakeButton.disabled = false;
+  retakeButton.disabled = isLoading;
   useReadingButton.disabled = isLoading || !scannerState.capturedReading;
 }
 
-function setDetectedReading(reading) {
+function setDetectedReading(reading, confidence = 0) {
   scannerState.capturedReading = reading;
+  scannerState.capturedConfidence = confidence;
   ocrResultElement.innerHTML = `Detected reading: <strong>${reading || "--"}</strong>`;
+  setConfidenceIndicator(reading ? confidence : 0);
   useReadingButton.disabled = !reading || scannerState.isProcessing;
 }
 
@@ -673,9 +958,11 @@ function setScannerMode(mode) {
 
 function resetCapturedState() {
   scannerState.scanToken += 1;
+  scannerState.activePassLabel = "";
   capturePreview.removeAttribute("src");
   resetCropPreview();
-  setDetectedReading("");
+  setDetectedReading("", 0);
+  setScannerPassSummary();
   setScannerLoading(false);
 }
 
@@ -694,8 +981,10 @@ async function requestCameraStream() {
     audio: false,
     video: {
       facingMode: { exact: "environment" },
-      width: { ideal: 1280 },
-      height: { ideal: 720 }
+      width: { ideal: 1920, min: 1280 },
+      height: { ideal: 1080, min: 720 },
+      aspectRatio: { ideal: 16 / 9 },
+      frameRate: { ideal: 30 }
     }
   };
 
@@ -703,8 +992,10 @@ async function requestCameraStream() {
     audio: false,
     video: {
       facingMode: "environment",
-      width: { ideal: 1280 },
-      height: { ideal: 720 }
+      width: { ideal: 1920, min: 1280 },
+      height: { ideal: 1080, min: 720 },
+      aspectRatio: { ideal: 16 / 9 },
+      frameRate: { ideal: 30 }
     }
   };
 
@@ -716,6 +1007,39 @@ async function requestCameraStream() {
     }
 
     return navigator.mediaDevices.getUserMedia(fallbackConstraints);
+  }
+}
+
+async function applyTrackPreferences(stream) {
+  const [track] = stream.getVideoTracks();
+
+  if (!track || typeof track.applyConstraints !== "function") {
+    return;
+  }
+
+  try {
+    const capabilities = typeof track.getCapabilities === "function"
+      ? track.getCapabilities()
+      : null;
+    const advancedConstraints = [];
+
+    if (Array.isArray(capabilities?.focusMode) && capabilities.focusMode.includes("continuous")) {
+      advancedConstraints.push({ focusMode: "continuous" });
+    }
+
+    if (Array.isArray(capabilities?.exposureMode) && capabilities.exposureMode.includes("continuous")) {
+      advancedConstraints.push({ exposureMode: "continuous" });
+    }
+
+    if (Array.isArray(capabilities?.whiteBalanceMode) && capabilities.whiteBalanceMode.includes("continuous")) {
+      advancedConstraints.push({ whiteBalanceMode: "continuous" });
+    }
+
+    if (advancedConstraints.length > 0) {
+      await track.applyConstraints({ advanced: advancedConstraints });
+    }
+  } catch (error) {
+    // Best-effort only. Unsupported camera controls should never block scanning.
   }
 }
 
@@ -743,6 +1067,7 @@ async function startCamera() {
     scannerState.stream = stream;
     cameraPreview.srcObject = stream;
     await cameraPreview.play();
+    await applyTrackPreferences(stream);
 
     if (scanToken !== scannerState.scanToken) {
       stopCamera();
@@ -750,6 +1075,7 @@ async function startCamera() {
     }
 
     captureButton.disabled = false;
+    setScannerPassSummary("Guide crop locked to the center box. Capture when the digits look sharp and evenly lit.");
     setScannerMessage("Hold steady, use good lighting, and keep the meter digits inside the guide box.");
   } catch (error) {
     if (scanToken !== scannerState.scanToken) {
@@ -791,27 +1117,106 @@ function createFullFrameCanvas() {
   return canvas;
 }
 
-function createCenterCropCanvas(sourceCanvas) {
-  const crop = {
-    x: Math.round(sourceCanvas.width * 0.2),
-    y: Math.round(sourceCanvas.height * 0.4),
-    width: Math.round(sourceCanvas.width * 0.6),
-    height: Math.round(sourceCanvas.height * 0.2)
-  };
+function createCanvas(width, height) {
   const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width));
+  canvas.height = Math.max(1, Math.round(height));
+  return canvas;
+}
+
+function cloneCanvas(sourceCanvas) {
+  const canvas = createCanvas(sourceCanvas.width, sourceCanvas.height);
   const context = canvas.getContext("2d");
 
-  canvas.width = Math.max(1, crop.width);
-  canvas.height = Math.max(1, crop.height);
+  context.drawImage(sourceCanvas, 0, 0);
+  return canvas;
+}
+
+function getDisplayedVideoRegion() {
+  const elementWidth = cameraPreview.clientWidth;
+  const elementHeight = cameraPreview.clientHeight;
+  const videoWidth = cameraPreview.videoWidth;
+  const videoHeight = cameraPreview.videoHeight;
+
+  if (!elementWidth || !elementHeight || !videoWidth || !videoHeight) {
+    return null;
+  }
+
+  const elementAspectRatio = elementWidth / elementHeight;
+  const videoAspectRatio = videoWidth / videoHeight;
+  let drawWidth = elementWidth;
+  let drawHeight = elementHeight;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (videoAspectRatio > elementAspectRatio) {
+    drawWidth = elementHeight * videoAspectRatio;
+    offsetX = (elementWidth - drawWidth) / 2;
+  } else {
+    drawHeight = elementWidth / videoAspectRatio;
+    offsetY = (elementHeight - drawHeight) / 2;
+  }
+
+  return { drawWidth, drawHeight, offsetX, offsetY };
+}
+
+function createGuideCropCanvas(sourceCanvas) {
+  const videoRegion = getDisplayedVideoRegion();
+  const videoRect = cameraPreview.getBoundingClientRect();
+  const guideRect = guideBox.getBoundingClientRect();
+
+  if (!videoRegion || !videoRect.width || !guideRect.width || !guideRect.height) {
+    const fallbackWidth = Math.round(sourceCanvas.width * 0.64);
+    const fallbackHeight = Math.round(sourceCanvas.height * 0.24);
+    const fallbackX = Math.round(sourceCanvas.width * 0.18);
+    const fallbackY = Math.round(sourceCanvas.height * 0.38);
+    const fallbackCanvas = createCanvas(fallbackWidth, fallbackHeight);
+    const fallbackContext = fallbackCanvas.getContext("2d");
+
+    fallbackContext.drawImage(
+      sourceCanvas,
+      clamp(fallbackX, 0, sourceCanvas.width - 1),
+      clamp(fallbackY, 0, sourceCanvas.height - 1),
+      clamp(fallbackWidth, 1, sourceCanvas.width - fallbackX),
+      clamp(fallbackHeight, 1, sourceCanvas.height - fallbackY),
+      0,
+      0,
+      fallbackCanvas.width,
+      fallbackCanvas.height
+    );
+
+    return fallbackCanvas;
+  }
+
+  const scaleX = sourceCanvas.width / videoRegion.drawWidth;
+  const scaleY = sourceCanvas.height / videoRegion.drawHeight;
+  const relativeLeft = guideRect.left - videoRect.left - videoRegion.offsetX;
+  const relativeTop = guideRect.top - videoRect.top - videoRegion.offsetY;
+  const paddingX = guideRect.width * SCANNER_CONFIG.cropPaddingX * scaleX;
+  const paddingY = guideRect.height * SCANNER_CONFIG.cropPaddingY * scaleY;
+  const crop = {
+    x: Math.round((relativeLeft * scaleX) - paddingX),
+    y: Math.round((relativeTop * scaleY) - paddingY),
+    width: Math.round((guideRect.width * scaleX) + (paddingX * 2)),
+    height: Math.round((guideRect.height * scaleY) + (paddingY * 2))
+  };
+
+  crop.x = clamp(crop.x, 0, sourceCanvas.width - 1);
+  crop.y = clamp(crop.y, 0, sourceCanvas.height - 1);
+  crop.width = clamp(crop.width, 1, sourceCanvas.width - crop.x);
+  crop.height = clamp(crop.height, 1, sourceCanvas.height - crop.y);
+
+  const canvas = createCanvas(crop.width, crop.height);
+  const context = canvas.getContext("2d");
 
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
   context.drawImage(
     sourceCanvas,
-    clamp(crop.x, 0, sourceCanvas.width),
-    clamp(crop.y, 0, sourceCanvas.height),
-    clamp(crop.width, 1, sourceCanvas.width - crop.x),
-    clamp(crop.height, 1, sourceCanvas.height - crop.y),
+    crop.x,
+    crop.y,
+    crop.width,
+    crop.height,
     0,
     0,
     canvas.width,
@@ -821,127 +1226,256 @@ function createCenterCropCanvas(sourceCanvas) {
   return canvas;
 }
 
-function applySharpenFilter(imageData, width, height) {
-  const source = new Uint8ClampedArray(imageData.data);
+function createOcrBaseCanvas(sourceCanvas) {
+  const scaleFactor = SCANNER_CONFIG.preprocessScale;
+  const paddingX = Math.round(sourceCanvas.width * 0.12 * scaleFactor);
+  const paddingY = Math.round(sourceCanvas.height * 0.22 * scaleFactor);
+  const scaledWidth = Math.round(sourceCanvas.width * scaleFactor);
+  const scaledHeight = Math.round(sourceCanvas.height * scaleFactor);
+  const canvas = createCanvas(scaledWidth + (paddingX * 2), scaledHeight + (paddingY * 2));
+  const context = canvas.getContext("2d");
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height, paddingX, paddingY, scaledWidth, scaledHeight);
+
+  return canvas;
+}
+
+function extractGrayscalePixels(imageData) {
+  const grayscale = new Uint8ClampedArray(imageData.width * imageData.height);
   const { data } = imageData;
-  const kernel = [
-    0, -1, 0,
-    -1, 5, -1,
-    0, -1, 0
-  ];
 
-  for (let y = 1; y < height - 1; y += 1) {
-    for (let x = 1; x < width - 1; x += 1) {
-      const destinationIndex = (y * width + x) * 4;
+  for (let index = 0, pixelIndex = 0; index < data.length; index += 4, pixelIndex += 1) {
+    grayscale[pixelIndex] = Math.round(
+      (data[index] * 0.299) +
+      (data[index + 1] * 0.587) +
+      (data[index + 2] * 0.114)
+    );
+  }
 
-      for (let channel = 0; channel < 3; channel += 1) {
-        let value = 0;
-        let kernelIndex = 0;
+  return grayscale;
+}
 
-        for (let sampleY = -1; sampleY <= 1; sampleY += 1) {
-          for (let sampleX = -1; sampleX <= 1; sampleX += 1) {
-            const sampleIndex = ((y + sampleY) * width + (x + sampleX)) * 4;
-            value += source[sampleIndex + channel] * kernel[kernelIndex];
-            kernelIndex += 1;
-          }
-        }
+function buildHistogram(pixels) {
+  const histogram = new Uint32Array(256);
 
-        data[destinationIndex + channel] = clamp(Math.round(value), 0, 255);
+  for (const value of pixels) {
+    histogram[value] += 1;
+  }
+
+  return histogram;
+}
+
+function getPercentileValue(histogram, totalPixels, percentile) {
+  const target = totalPixels * percentile;
+  let runningTotal = 0;
+
+  for (let value = 0; value < histogram.length; value += 1) {
+    runningTotal += histogram[value];
+
+    if (runningTotal >= target) {
+      return value;
+    }
+  }
+
+  return 255;
+}
+
+function applyLevels(pixels, options = {}) {
+  const {
+    blackPointPercentile = 0.01,
+    whitePointPercentile = 0.99,
+    gamma = 1
+  } = options;
+  const histogram = buildHistogram(pixels);
+  const blackPoint = getPercentileValue(histogram, pixels.length, blackPointPercentile);
+  const whitePoint = Math.max(blackPoint + 8, getPercentileValue(histogram, pixels.length, whitePointPercentile));
+  const leveled = new Uint8ClampedArray(pixels.length);
+
+  for (let index = 0; index < pixels.length; index += 1) {
+    const normalized = clamp((pixels[index] - blackPoint) / (whitePoint - blackPoint), 0, 1);
+    leveled[index] = Math.round((normalized ** gamma) * 255);
+  }
+
+  return leveled;
+}
+
+function applyContrastBoost(pixels, factor = 1.25) {
+  const contrasted = new Uint8ClampedArray(pixels.length);
+
+  for (let index = 0; index < pixels.length; index += 1) {
+    contrasted[index] = clamp(Math.round(((pixels[index] - 128) * factor) + 128), 0, 255);
+  }
+
+  return contrasted;
+}
+
+function ensureLightBackground(pixels, width, height) {
+  const edgeThickness = Math.max(2, Math.round(Math.min(width, height) * 0.06));
+  let edgeTotal = 0;
+  let edgeCount = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (x < edgeThickness || x >= width - edgeThickness || y < edgeThickness || y >= height - edgeThickness) {
+        edgeTotal += pixels[(y * width) + x];
+        edgeCount += 1;
       }
     }
   }
 
-  return imageData;
-}
-
-function computeOtsuThreshold(histogram, totalPixels) {
-  let sum = 0;
-
-  for (let value = 0; value < histogram.length; value += 1) {
-    sum += value * histogram[value];
-  }
-
-  let sumBackground = 0;
-  let backgroundWeight = 0;
-  let bestVariance = 0;
-  let bestThreshold = 128;
-
-  for (let threshold = 0; threshold < histogram.length; threshold += 1) {
-    backgroundWeight += histogram[threshold];
-
-    if (!backgroundWeight) {
-      continue;
-    }
-
-    const foregroundWeight = totalPixels - backgroundWeight;
-
-    if (!foregroundWeight) {
-      break;
-    }
-
-    sumBackground += threshold * histogram[threshold];
-
-    const meanBackground = sumBackground / backgroundWeight;
-    const meanForeground = (sum - sumBackground) / foregroundWeight;
-    const betweenClassVariance = backgroundWeight * foregroundWeight * ((meanBackground - meanForeground) ** 2);
-
-    if (betweenClassVariance > bestVariance) {
-      bestVariance = betweenClassVariance;
-      bestThreshold = threshold;
+  if (edgeCount && (edgeTotal / edgeCount) < 128) {
+    for (let index = 0; index < pixels.length; index += 1) {
+      pixels[index] = 255 - pixels[index];
     }
   }
 
-  return bestThreshold;
+  return pixels;
 }
 
-function preprocessForOcr(sourceCanvas) {
-  const scaleFactor = 2;
-  const paddingX = Math.round(sourceCanvas.width * 0.08 * scaleFactor);
-  const paddingY = Math.round(sourceCanvas.height * 0.18 * scaleFactor);
-  const processedCanvas = document.createElement("canvas");
-  const processedContext = processedCanvas.getContext("2d", { willReadFrequently: true });
+function applySharpenToGrayscale(pixels, width, height) {
+  const source = new Uint8ClampedArray(pixels);
+  const sharpened = new Uint8ClampedArray(pixels);
+  const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
 
-  processedCanvas.width = Math.max(1, Math.round(sourceCanvas.width * scaleFactor) + (paddingX * 2));
-  processedCanvas.height = Math.max(1, Math.round(sourceCanvas.height * scaleFactor) + (paddingY * 2));
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      let value = 0;
+      let kernelIndex = 0;
 
-  processedContext.fillStyle = "#ffffff";
-  processedContext.fillRect(0, 0, processedCanvas.width, processedCanvas.height);
-  processedContext.imageSmoothingEnabled = true;
-  processedContext.imageSmoothingQuality = "high";
-  processedContext.drawImage(
-    sourceCanvas,
-    0,
-    0,
-    sourceCanvas.width,
-    sourceCanvas.height,
-    paddingX,
-    paddingY,
-    Math.round(sourceCanvas.width * scaleFactor),
-    Math.round(sourceCanvas.height * scaleFactor)
+      for (let sampleY = -1; sampleY <= 1; sampleY += 1) {
+        for (let sampleX = -1; sampleX <= 1; sampleX += 1) {
+          value += source[((y + sampleY) * width) + (x + sampleX)] * kernel[kernelIndex];
+          kernelIndex += 1;
+        }
+      }
+
+      sharpened[(y * width) + x] = clamp(Math.round(value), 0, 255);
+    }
+  }
+
+  return sharpened;
+}
+
+function applyAdaptiveThreshold(pixels, width, height) {
+  const radius = Math.max(12, Math.round(Math.min(width, height) * 0.08));
+  const bias = 10;
+  const integralWidth = width + 1;
+  const integral = new Uint32Array((width + 1) * (height + 1));
+
+  for (let y = 1; y <= height; y += 1) {
+    let rowTotal = 0;
+
+    for (let x = 1; x <= width; x += 1) {
+      rowTotal += pixels[((y - 1) * width) + (x - 1)];
+      integral[(y * integralWidth) + x] = integral[((y - 1) * integralWidth) + x] + rowTotal;
+    }
+  }
+
+  const thresholded = new Uint8ClampedArray(width * height);
+
+  for (let y = 0; y < height; y += 1) {
+    const top = Math.max(0, y - radius);
+    const bottom = Math.min(height - 1, y + radius);
+
+    for (let x = 0; x < width; x += 1) {
+      const left = Math.max(0, x - radius);
+      const right = Math.min(width - 1, x + radius);
+      const area = (right - left + 1) * (bottom - top + 1);
+      const sum =
+        integral[((bottom + 1) * integralWidth) + (right + 1)] -
+        integral[(top * integralWidth) + (right + 1)] -
+        integral[((bottom + 1) * integralWidth) + left] +
+        integral[(top * integralWidth) + left];
+      const index = (y * width) + x;
+      const localAverage = sum / area;
+
+      thresholded[index] = pixels[index] > (localAverage - bias) ? 255 : 0;
+    }
+  }
+
+  return ensureLightBackground(thresholded, width, height);
+}
+
+function createCanvasFromGrayscale(pixels, width, height) {
+  const canvas = createCanvas(width, height);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const imageData = context.createImageData(width, height);
+
+  for (let index = 0, pixelIndex = 0; pixelIndex < pixels.length; index += 4, pixelIndex += 1) {
+    imageData.data[index] = pixels[pixelIndex];
+    imageData.data[index + 1] = pixels[pixelIndex];
+    imageData.data[index + 2] = pixels[pixelIndex];
+    imageData.data[index + 3] = 255;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+function buildOcrVariants(sourceCanvas) {
+  const baseCanvas = createOcrBaseCanvas(sourceCanvas);
+  const context = baseCanvas.getContext("2d", { willReadFrequently: true });
+  const imageData = context.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
+  const normalizedGrayscale = ensureLightBackground(
+    applyLevels(extractGrayscalePixels(imageData), {
+      blackPointPercentile: 0.01,
+      whitePointPercentile: 0.99,
+      gamma: 0.96
+    }),
+    baseCanvas.width,
+    baseCanvas.height
+  );
+  const contrastPixels = applyContrastBoost(
+    applyLevels(normalizedGrayscale, {
+      blackPointPercentile: 0.02,
+      whitePointPercentile: 0.985,
+      gamma: 0.92
+    }),
+    1.36
+  );
+  const adaptivePixels = applyAdaptiveThreshold(contrastPixels, baseCanvas.width, baseCanvas.height);
+  const sharpenedPixels = ensureLightBackground(
+    applyLevels(
+      applySharpenToGrayscale(contrastPixels, baseCanvas.width, baseCanvas.height),
+      {
+        blackPointPercentile: 0.02,
+        whitePointPercentile: 0.99,
+        gamma: 0.94
+      }
+    ),
+    baseCanvas.width,
+    baseCanvas.height
   );
 
-  let imageData = processedContext.getImageData(0, 0, processedCanvas.width, processedCanvas.height);
-  imageData = applySharpenFilter(imageData, processedCanvas.width, processedCanvas.height);
-  const { data } = imageData;
-
-  for (let index = 0; index < data.length; index += 4) {
-    const grayscale = Math.round((data[index] * 0.299) + (data[index + 1] * 0.587) + (data[index + 2] * 0.114));
-    const contrasted = clamp(Math.round((grayscale - 128) * 2.1 + 128), 0, 255);
-    const binaryValue = contrasted > 140 ? 255 : 0;
-
-    data[index] = binaryValue;
-    data[index + 1] = binaryValue;
-    data[index + 2] = binaryValue;
-    data[index + 3] = 255;
-  }
-
-  processedContext.putImageData(imageData, 0, 0);
-
-  return processedCanvas;
+  return [
+    { id: "original", label: "Original", canvas: cloneCanvas(baseCanvas) },
+    { id: "contrast", label: "Contrast", canvas: createCanvasFromGrayscale(contrastPixels, baseCanvas.width, baseCanvas.height) },
+    { id: "adaptive", label: "Adaptive", canvas: createCanvasFromGrayscale(adaptivePixels, baseCanvas.width, baseCanvas.height) },
+    { id: "sharpened", label: "Sharpened", canvas: createCanvasFromGrayscale(sharpenedPixels, baseCanvas.width, baseCanvas.height) }
+  ];
 }
 
 function normalizeOcrText(text) {
-  const cleanedText = text.replace(/[^0-9]/g, " ");
+  const normalizationMap = {
+    O: "0",
+    D: "0",
+    Q: "0",
+    I: "1",
+    L: "1",
+    "|": "1",
+    S: "5",
+    B: "8"
+  };
+  const cleanedText = String(text || "")
+    .toUpperCase()
+    .split("")
+    .map((character) => normalizationMap[character] || character)
+    .join("")
+    .replace(/[^0-9]/g, " ");
   const sequences = (cleanedText.match(/\d+/g) || []).sort((left, right) => {
     if (right.length !== left.length) {
       return right.length - left.length;
@@ -954,7 +1488,7 @@ function normalizeOcrText(text) {
     return sequences[0];
   }
 
-  return text.replace(/[^0-9]/g, "");
+  return cleanedText.replace(/[^0-9]/g, "");
 }
 
 function formatProgressStatus(status) {
@@ -979,56 +1513,344 @@ async function getOcrWorker() {
       const progressText = typeof progress === "number"
         ? `${Math.round(progress * 100)}%`
         : "";
+      const prefix = scannerState.activePassLabel
+        ? `${scannerState.activePassLabel}: `
+        : "";
 
-      setScannerMessage([formatProgressStatus(status), progressText].filter(Boolean).join(" "));
+      setScannerMessage([`${prefix}${formatProgressStatus(status)}`, progressText].filter(Boolean).join(" "));
     }
   });
 
   await scannerState.worker.setParameters({
     tessedit_char_whitelist: "0123456789",
     tessedit_pageseg_mode: 7,
-    preserve_interword_spaces: 0
+    preserve_interword_spaces: 0,
+    classify_bln_numeric_mode: 1,
+    user_defined_dpi: "300"
   });
 
   return scannerState.worker;
 }
 
-async function runOcr(capturedCanvas, scanToken) {
-  setDetectedReading("");
-  setScannerLoading(true);
-  setScannerMessage("Scanning...");
+function createOcrCandidate({
+  engine,
+  variantId,
+  label,
+  rawText,
+  confidence,
+  previewCanvas
+}) {
+  const text = normalizeOcrText(rawText);
+  const normalizedConfidence = clamp(Math.round(confidence || 0), 0, 100);
+
+  return {
+    engine,
+    variantId,
+    label,
+    rawText: String(rawText || "").trim(),
+    text,
+    confidence: normalizedConfidence,
+    previewCanvas,
+    score: normalizedConfidence + (text.length * 8) + (engine === "ocrad" ? -8 : 0)
+  };
+}
+
+async function runTesseractPasses(variants, scanToken) {
+  const worker = await getOcrWorker();
+  const passResults = [];
+
+  for (const pass of SCANNER_CONFIG.tesseractPasses) {
+    if (scanToken !== scannerState.scanToken) {
+      return [];
+    }
+
+    const variant = variants.find((entry) => entry.id === pass.id);
+
+    if (!variant) {
+      continue;
+    }
+
+    scannerState.activePassLabel = `${pass.label} pass`;
+    setScannerMessage(`Running ${pass.label.toLowerCase()} OCR pass...`);
+
+    const result = await worker.recognize(variant.canvas);
+
+    passResults.push(createOcrCandidate({
+      engine: "tesseract",
+      variantId: pass.id,
+      label: pass.label,
+      rawText: result.data?.text || "",
+      confidence: result.data?.confidence || 0,
+      previewCanvas: variant.canvas
+    }));
+  }
+
+  return passResults;
+}
+
+function runFallbackOcrPass(variants) {
+  if (typeof window.OCRAD !== "function") {
+    return [];
+  }
+
+  const adaptiveVariant = variants.find((entry) => entry.id === "adaptive") || variants[0];
+
+  if (!adaptiveVariant) {
+    return [];
+  }
 
   try {
-    const processedCanvas = preprocessForOcr(capturedCanvas);
-    const worker = await getOcrWorker();
+    scannerState.activePassLabel = "Fallback pass";
+    setScannerMessage("Cross-checking with fallback OCR...");
+
+    return [
+      createOcrCandidate({
+        engine: "ocrad",
+        variantId: adaptiveVariant.id,
+        label: "Fallback",
+        rawText: window.OCRAD(adaptiveVariant.canvas) || "",
+        confidence: 54,
+        previewCanvas: adaptiveVariant.canvas
+      })
+    ];
+  } catch (error) {
+    return [];
+  }
+}
+
+function chooseBestOcrResult(candidates) {
+  const usableCandidates = candidates.filter((candidate) => candidate.text);
+
+  if (usableCandidates.length === 0) {
+    return {
+      accepted: false,
+      confidence: 0,
+      bestCandidate: null,
+      bestText: ""
+    };
+  }
+
+  const groupedCandidates = usableCandidates.reduce((groups, candidate) => {
+    const group = groups.get(candidate.text) || {
+      text: candidate.text,
+      count: 0,
+      totalConfidence: 0,
+      bestConfidence: 0,
+      bestCandidate: candidate,
+      engineSet: new Set(),
+      variantSet: new Set(),
+      weightedScore: 0
+    };
+
+    group.count += 1;
+    group.totalConfidence += candidate.confidence;
+    group.bestConfidence = Math.max(group.bestConfidence, candidate.confidence);
+    group.engineSet.add(candidate.engine);
+    group.variantSet.add(candidate.variantId);
+    group.weightedScore += candidate.score;
+
+    if (
+      candidate.confidence > group.bestCandidate.confidence ||
+      (candidate.confidence === group.bestCandidate.confidence && candidate.text.length > group.bestCandidate.text.length)
+    ) {
+      group.bestCandidate = candidate;
+    }
+
+    groups.set(candidate.text, group);
+    return groups;
+  }, new Map());
+
+  const rankedGroups = [...groupedCandidates.values()]
+    .map((group) => {
+      const averageConfidence = group.totalConfidence / group.count;
+      const finalScore =
+        (group.count * 52) +
+        (group.engineSet.size * 16) +
+        (group.variantSet.size * 10) +
+        (group.text.length * 7) +
+        (averageConfidence * 0.55) +
+        (group.bestConfidence * 0.12) +
+        (group.weightedScore * 0.1);
+
+      return {
+        ...group,
+        averageConfidence,
+        finalScore
+      };
+    })
+    .sort((left, right) => {
+      if (right.finalScore !== left.finalScore) {
+        return right.finalScore - left.finalScore;
+      }
+
+      if (right.count !== left.count) {
+        return right.count - left.count;
+      }
+
+      if (right.text.length !== left.text.length) {
+        return right.text.length - left.text.length;
+      }
+
+      return right.bestConfidence - left.bestConfidence;
+    });
+
+  const bestGroup = rankedGroups[0];
+  const runnerUp = rankedGroups[1];
+  const consensusRatio = bestGroup.count / usableCandidates.length;
+  const confidence = clamp(
+    Math.round(
+      (bestGroup.averageConfidence * 0.46) +
+      (bestGroup.bestConfidence * 0.18) +
+      (consensusRatio * 100 * 0.22) +
+      (bestGroup.engineSet.size > 1 ? 10 : 0) +
+      Math.min(12, bestGroup.text.length * 2)
+    ),
+    0,
+    99
+  );
+  const consistentEnough =
+    bestGroup.count >= SCANNER_CONFIG.minConsensusMatches ||
+    (bestGroup.engineSet.size > 1 && consensusRatio >= 0.4);
+  const separatedEnough =
+    !runnerUp ||
+    bestGroup.count > runnerUp.count ||
+    (bestGroup.finalScore - runnerUp.finalScore) >= 12;
+  const accepted =
+    bestGroup.text.length >= SCANNER_CONFIG.minDigits &&
+    consistentEnough &&
+    separatedEnough &&
+    confidence >= SCANNER_CONFIG.minAcceptedConfidence;
+
+  return {
+    accepted,
+    confidence,
+    bestCandidate: bestGroup.bestCandidate,
+    bestText: bestGroup.text
+  };
+}
+
+function summarizePasses(candidates) {
+  if (candidates.length === 0) {
+    return "No OCR passes produced readable digits on this frame.";
+  }
+
+  return candidates
+    .map((candidate) => {
+      const reading = candidate.text || "--";
+      const confidence = candidate.engine === "ocrad"
+        ? ""
+        : ` ${candidate.confidence}%`;
+
+      return `${candidate.label}: ${reading}${confidence}`.trim();
+    })
+    .join(" | ");
+}
+
+function updateCropPreview(canvas) {
+  if (!canvas) {
+    resetCropPreview();
+    return;
+  }
+
+  cropPreview.src = canvas.toDataURL("image/png");
+  cropPreview.classList.remove("is-hidden");
+}
+
+async function runMlEnhancedOcr(capturedCanvas, scanToken) {
+  setDetectedReading("", 0);
+  setAiSourceBadge(false);
+  setScannerLoading(true);
+  setScannerPassSummary("Preparing crop for multi-pass analysis...");
+  setScannerMessage("Running AI quality check...");
+  mlState.tfUsedInLastScan = false;
+
+  try {
+    // ── Stage 1: ML quality gate ──────────────────────────────────────────
+    const quality = await assessImageQuality(capturedCanvas);
 
     if (scanToken !== scannerState.scanToken) {
       return;
     }
 
-    const result = await worker.recognize(processedCanvas);
+    if (!quality.isUsable) {
+      const reason = quality.glareScore >= ML_CONFIG.glareThreshold
+        ? "Too much glare on the meter. Tilt slightly to reduce reflections."
+        : "Image too blurry. Hold the phone steadier and ensure good lighting.";
+
+      setScannerMessage(`AI quality check: ${reason}`);
+      setScannerPassSummary(`Sharpness: ${quality.blurScore.toFixed(1)} | Glare: ${quality.glareScore.toFixed(1)}%`);
+      setConfidenceIndicator(0);
+      // Still run OCR — quality gate is advisory, not hard-blocking
+    } else {
+      setScannerMessage("Quality OK. Enhancing image with AI...");
+    }
+
+    // ── Stage 2: TF.js unsharp-mask preprocessing ─────────────────────────
+    let enhancedCanvas = capturedCanvas;
+
+    if (isTfAvailable() && mlState.tfReady) {
+      setScannerMessage("AI sharpening image...");
+      enhancedCanvas = await applyTfEnhancement(capturedCanvas);
+      mlState.tfUsedInLastScan = true;
+    }
 
     if (scanToken !== scannerState.scanToken) {
       return;
     }
 
-    const reading = normalizeOcrText(result.data.text || "");
+    // ── Stage 3: Multi-pass Tesseract OCR on enhanced image ───────────────
+    setScannerMessage("Running ensemble OCR passes...");
+    const variants = buildOcrVariants(enhancedCanvas);
 
-    cropPreview.src = processedCanvas.toDataURL("image/png");
-    cropPreview.classList.remove("is-hidden");
-
-    if (!reading || reading.length < 3) {
-      setScannerMessage("Try again, keep digits inside box and hold steady.");
+    if (scanToken !== scannerState.scanToken) {
       return;
     }
 
-    setDetectedReading(reading);
-    setScannerMessage("Reading detected. Use it or retake the photo.");
+    updateCropPreview((variants.find((v) => v.id === "adaptive") || variants[0])?.canvas || null);
+
+    const tesseractResults = await runTesseractPasses(variants, scanToken);
+
+    if (scanToken !== scannerState.scanToken) {
+      return;
+    }
+
+    const fallbackResults = runFallbackOcrPass(variants);
+    const allResults = [...tesseractResults, ...fallbackResults];
+    const decision = chooseBestOcrResult(allResults);
+    const previewCanvas =
+      decision.bestCandidate?.previewCanvas ||
+      (variants.find((v) => v.id === "adaptive") || variants[0])?.canvas ||
+      null;
+
+    updateCropPreview(previewCanvas);
+
+    // Build pass summary — prepend quality info
+    const qualityNote = quality.isUsable
+      ? `AI: sharp ${quality.blurScore.toFixed(1)}`
+      : `AI: ${quality.label}`;
+    setScannerPassSummary(`${qualityNote} | ${summarizePasses(allResults)}`);
+
+    if (mlState.tfUsedInLastScan) {
+      setAiSourceBadge(true);
+    }
+
+    if (!decision.accepted || !decision.bestText) {
+      setConfidenceIndicator(decision.confidence);
+      setScannerMessage("Low confidence result. Retake with steadier framing, less glare, and brighter light.");
+      return;
+    }
+
+    setDetectedReading(decision.bestText, decision.confidence);
+    setScannerMessage("Reading detected. Review the number and save it if it looks correct.");
   } catch (error) {
     if (scanToken === scannerState.scanToken) {
+      setDetectedReading("", 0);
+      setScannerPassSummary("The scanner could not reach a stable numeric consensus on this frame.");
       setScannerMessage("OCR failed on this capture. Retake the photo and try again.");
     }
   } finally {
+    scannerState.activePassLabel = "";
+
     if (scanToken === scannerState.scanToken) {
       setScannerLoading(false);
     }
@@ -1047,21 +1869,42 @@ async function handleCapture() {
     return;
   }
 
-  const capturedCanvas = createCenterCropCanvas(fullFrameCanvas);
+  stopLiveQualityMonitor();
+  hideQualityBadge();
+
+  const capturedCanvas = createGuideCropCanvas(fullFrameCanvas);
 
   capturePreview.src = fullFrameCanvas.toDataURL("image/jpeg", 0.95);
   stopCamera();
   setScannerMode("captured");
-  retakeButton.disabled = false;
-  await runOcr(capturedCanvas, scannerState.scanToken);
+  setScannerPassSummary("Full-resolution frame captured. Running AI-enhanced OCR passes...");
+  await runMlEnhancedOcr(capturedCanvas, scannerState.scanToken);
 }
 
 async function openScanner() {
   showScanner();
+  setConfidenceIndicator(0);
+  setAiSourceBadge(false);
+
+  // Lazy-warm TF.js on first open
+  if (isTfAvailable() && !mlState.tfReady) {
+    showAiModelStatus("loading");
+    warmUpTf().then(() => {
+      if (mlState.tfReady) {
+        showAiModelStatus("ready");
+      } else {
+        hideAiModelStatus();
+      }
+    });
+  }
+
   await startCamera();
+  startLiveQualityMonitor();
 }
 
 function closeScanner() {
+  stopLiveQualityMonitor();
+  hideQualityBadge();
   stopCamera();
   resetCapturedState();
   setScannerMode("live");
@@ -1070,8 +1913,10 @@ function closeScanner() {
 }
 
 async function retakeCapture() {
+  hideQualityBadge();
   resetCapturedState();
   await startCamera();
+  startLiveQualityMonitor();
 }
 
 function applyDetectedReading() {
@@ -1098,6 +1943,7 @@ async function cleanupOcrWorker() {
 
   await scannerState.worker.terminate();
   scannerState.worker = null;
+  scannerState.activePassLabel = "";
 }
 
 function resetCropPreview() {
@@ -1130,6 +1976,7 @@ useReadingButton.addEventListener("click", applyDetectedReading);
 window.addEventListener("keydown", handleEscapeClose);
 window.addEventListener("resize", handleResize);
 window.addEventListener("beforeunload", () => {
+  stopLiveQualityMonitor();
   stopCamera();
   cleanupOcrWorker();
 });

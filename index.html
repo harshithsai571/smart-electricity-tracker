@@ -9,6 +9,7 @@
   <title>Smart Electricity Tracker</title>
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-512.svg">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -171,10 +172,18 @@
       <div class="scanner-overlay">
         <div class="scanner-topbar">
           <h2 id="scanner-title">Meter Scanner</h2>
-          <button id="close-scanner" type="button" class="ghost-button" aria-label="Close scanner">Close</button>
+          <div class="scanner-topbar-right">
+            <span id="ai-model-status" class="ai-model-badge ai-model-badge--loading is-hidden" aria-live="polite">AI Loading…</span>
+            <button id="close-scanner" type="button" class="ghost-button" aria-label="Close scanner">Close</button>
+          </div>
         </div>
 
         <div class="guide-shell">
+          <div id="quality-badge-wrap" class="quality-badge-wrap is-hidden" aria-live="polite">
+            <span id="quality-icon" class="quality-icon" aria-hidden="true">●</span>
+            <span id="quality-label">Checking…</span>
+            <span id="blur-score-detail" class="quality-score-detail"></span>
+          </div>
           <div id="guide-box" class="guide-box">
             <span>Align the meter digits inside this box</span>
           </div>
@@ -188,6 +197,11 @@
 
           <p id="scanner-status" class="scanner-status">Hold steady, use good lighting, and keep the meter digits inside the guide box.</p>
           <p id="ocr-result" class="ocr-result">Detected reading: <strong>--</strong></p>
+          <div class="confidence-row">
+            <p id="ocr-confidence" class="ocr-confidence" data-level="idle">Confidence: --</p>
+            <span id="ai-source-badge" class="ai-source-badge is-hidden">AI + OCR</span>
+          </div>
+          <p id="scanner-pass-summary" class="scanner-pass-summary" aria-live="polite">Capture a clear frame to start multi-pass scanning.</p>
           <img id="crop-preview" class="crop-preview is-hidden" alt="Cropped meter preview used for OCR">
 
           <div class="scanner-actions">
@@ -213,6 +227,7 @@
     </div>
   </section>
 
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <script src="script.js"></script>
 </body>

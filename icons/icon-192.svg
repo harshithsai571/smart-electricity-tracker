@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <defs>
+    <!-- Background gradient: deep teal to rich emerald -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#0d4f4a"/>
+      <stop offset="100%" stop-color="#0f8a7e"/>
+    </linearGradient>
+    <!-- Meter screen gradient -->
+    <linearGradient id="screen" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#082e2b"/>
+      <stop offset="100%" stop-color="#0a3d39"/>
+    </linearGradient>
+    <!-- Bolt glow -->
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect width="192" height="192" rx="44" fill="url(#bg)"/>
+
+  <!-- Subtle inner highlight ring -->
+  <rect x="6" y="6" width="180" height="180" rx="40" fill="none"
+        stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+
+  <!-- Meter body -->
+  <rect x="28" y="30" width="136" height="110" rx="16" fill="url(#screen)"/>
+  <!-- Meter body highlight border -->
+  <rect x="28" y="30" width="136" height="110" rx="16" fill="none"
+        stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
+
+  <!-- Meter top bump (like a real meter casing) -->
+  <rect x="68" y="24" width="56" height="14" rx="7" fill="#0a3d39"/>
+  <rect x="68" y="24" width="56" height="14" rx="7" fill="none"
+        stroke="rgba(255,255,255,0.1)" stroke-width="1"/>
+
+  <!-- LCD digit display panel -->
+  <rect x="40" y="45" width="112" height="36" rx="8" fill="#041e1c"/>
+  <rect x="40" y="45" width="112" height="36" rx="8" fill="none"
+        stroke="rgba(100,220,200,0.18)" stroke-width="1"/>
+
+  <!-- LCD digit placeholders (5 digit slots) -->
+  <!-- Digit 1 -->
+  <rect x="46" y="51" width="16" height="24" rx="3" fill="#0d3330"/>
+  <text x="54" y="69" font-family="'Courier New',monospace" font-size="17"
+        font-weight="700" fill="#4dffd6" text-anchor="middle">8</text>
+
+  <!-- Digit 2 -->
+  <rect x="66" y="51" width="16" height="24" rx="3" fill="#0d3330"/>
+  <text x="74" y="69" font-family="'Courier New',monospace" font-size="17"
+        font-weight="700" fill="#4dffd6" text-anchor="middle">4</text>
+
+  <!-- Digit 3 -->
+  <rect x="86" y="51" width="16" height="24" rx="3" fill="#0d3330"/>
+  <text x="94" y="69" font-family="'Courier New',monospace" font-size="17"
+        font-weight="700" fill="#4dffd6" text-anchor="middle">7</text>
+
+  <!-- Digit 4 -->
+  <rect x="106" y="51" width="16" height="24" rx="3" fill="#0d3330"/>
+  <text x="114" y="69" font-family="'Courier New',monospace" font-size="17"
+        font-weight="700" fill="#4dffd6" text-anchor="middle">2</text>
+
+  <!-- Digit 5 -->
+  <rect x="126" y="51" width="16" height="24" rx="3" fill="#0d3330"/>
+  <text x="134" y="69" font-family="'Courier New',monospace" font-size="17"
+        font-weight="700" fill="#4dffd6" text-anchor="middle">1</text>
+
+  <!-- "kWh" unit label -->
+  <text x="149" y="69" font-family="'Segoe UI',Arial,sans-serif" font-size="9"
+        font-weight="700" fill="rgba(100,220,200,0.55)" text-anchor="start">kWh</text>
+
+  <!-- Meter scale markings / tick marks -->
+  <line x1="44" y1="90" x2="44" y2="98" stroke="rgba(255,255,255,0.25)" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="60" y1="90" x2="60" y2="96" stroke="rgba(255,255,255,0.15)" stroke-width="1" stroke-linecap="round"/>
+  <line x1="76" y1="90" x2="76" y2="96" stroke="rgba(255,255,255,0.15)" stroke-width="1" stroke-linecap="round"/>
+  <line x1="92" y1="90" x2="92" y2="99" stroke="rgba(255,255,255,0.3)"  stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="108" y1="90" x2="108" y2="96" stroke="rgba(255,255,255,0.15)" stroke-width="1" stroke-linecap="round"/>
+  <line x1="124" y1="90" x2="124" y2="96" stroke="rgba(255,255,255,0.15)" stroke-width="1" stroke-linecap="round"/>
+  <line x1="140" y1="90" x2="140" y2="98" stroke="rgba(255,255,255,0.25)" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- Meter needle arc (decorative) -->
+  <path d="M 44 100 Q 96 82 148 100" fill="none"
+        stroke="rgba(77,255,214,0.2)" stroke-width="1.5"/>
+
+  <!-- Small status LED dots -->
+  <circle cx="50"  cy="114" r="3.5" fill="#22c55e" opacity="0.9"/>
+  <circle cx="62"  cy="114" r="3.5" fill="#f59e0b" opacity="0.7"/>
+  <circle cx="148" cy="114" r="3.5" fill="#4dffd6" opacity="0.8"/>
+
+  <!-- Meter label strip -->
+  <text x="96" y="127" font-family="'Segoe UI',Arial,sans-serif" font-size="8"
+        font-weight="600" fill="rgba(255,255,255,0.35)" text-anchor="middle"
+        letter-spacing="1.5">ENERGY METER</text>
+
+  <!-- Bottom screw details -->
+  <circle cx="40"  cy="132" r="4" fill="#0a3d39" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+  <circle cx="152" cy="132" r="4" fill="#0a3d39" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+
+  <!-- Lightning bolt (overlaid bottom-right, glowing) -->
+  <g filter="url(#glow)" transform="translate(98, 138) scale(0.9)">
+    <polygon points="28,-2 8,26 20,26 4,54 36,18 22,18"
+             fill="#facc15" opacity="0.95"/>
+  </g>
+
+  <!-- Bottom bar / ground line -->
+  <rect x="28" y="152" width="136" height="4" rx="2" fill="rgba(255,255,255,0.06)"/>
+
+  <!-- Tiny chart bars at the very bottom (represents analytics) -->
+  <rect x="38" y="160" width="8"  height="20" rx="2" fill="rgba(77,255,214,0.3)"/>
+  <rect x="50" y="155" width="8"  height="25" rx="2" fill="rgba(77,255,214,0.45)"/>
+  <rect x="62" y="162" width="8"  height="18" rx="2" fill="rgba(77,255,214,0.3)"/>
+  <rect x="74" y="150" width="8"  height="30" rx="2" fill="rgba(77,255,214,0.6)"/>
+  <rect x="86" y="157" width="8"  height="23" rx="2" fill="rgba(77,255,214,0.4)"/>
+  <rect x="98" y="153" width="8"  height="27" rx="2" fill="rgba(77,255,214,0.5)"/>
+</svg>
