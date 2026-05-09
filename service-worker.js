@@ -1,4 +1,5 @@
-const CACHE_NAME = "smart-electricity-tracker-v1.0.1";
+const CACHE_NAME = "smart-electricity-tracker-v1.1.0";
+
 const APP_SHELL = [
   "./",
   "index.html",
