@@ -1,4 +1,5 @@
-const CACHE_NAME = "smart-electricity-tracker-v1.1.2";
+const CACHE_NAME = "smart-electricity-tracker-v1.1.3";
+
 
 
 

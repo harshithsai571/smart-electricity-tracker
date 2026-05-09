@@ -1,4 +1,5 @@
-const APP_VERSION = "1.1.2";
+const APP_VERSION = "1.1.3";
+
 
 
 
@@ -1370,6 +1371,174 @@ function applySharpenToGrayscale(pixels, width, height) {
   return sharpened;
 }
 
+// ─── Digit segmentation via vertical projection ───────────────────────────
+// Counts dark pixels per column, smooths the profile, then finds gaps
+// that separate individual digit characters.
+function findDigitBoundaries(pixels, width, height) {
+  const proj = new Array(width).fill(0);
+  for (let i = 0; i < pixels.length; i++) {
+    if (pixels[i] < 128) proj[i % width]++;
+  }
+
+  const maxP = Math.max(...proj, 1);
+  const cutoff = maxP * 0.07;
+  // 5-wide moving average to bridge small intra-digit gaps
+  const smooth = proj.map((_, i) => {
+    let s = 0;
+    for (let d = -2; d <= 2; d++) s += proj[clamp(i + d, 0, width - 1)];
+    return s / 5;
+  });
+
+  const minW = Math.max(4, Math.round(width * 0.03));
+  const bounds = [];
+  let inD = false, start = 0;
+
+  for (let x = 0; x < width; x++) {
+    if (!inD && smooth[x] > cutoff) { inD = true; start = x; }
+    else if (inD && smooth[x] <= cutoff) {
+      inD = false;
+      if (x - start >= minW) {
+        bounds.push({ x: Math.max(0, start - 2), w: Math.min(width, x + 2) - Math.max(0, start - 2) });
+      }
+    }
+  }
+  if (inD && width - start >= minW) {
+    bounds.push({ x: Math.max(0, start - 2), w: width - Math.max(0, start - 2) });
+  }
+  return bounds;
+}
+
+// ─── 7-Segment zone classifier ────────────────────────────────────────────
+// Divides a single digit's pixel region into the 7 standard LCD zones and
+// pattern-matches against a truth table.  No external model needed.
+function classify7SegDigit(pixels, width, height) {
+  const zone = (x1, y1, x2, y2) => {
+    let dark = 0, total = 0;
+    for (let y = Math.round(y1); y < Math.round(y2); y++) {
+      for (let x = Math.round(x1); x < Math.round(x2); x++) {
+        if (x >= 0 && x < width && y >= 0 && y < height) {
+          if (pixels[y * width + x] < 128) dark++;
+          total++;
+        }
+      }
+    }
+    return total > 0 ? dark / total : 0;
+  };
+
+  const w3 = width * 0.28, w7 = width - w3;
+  const h4 = height * 0.14, h2 = height * 0.50, h6 = height - h4;
+  const TH = 0.12; // segment "on" threshold
+
+  const s = {
+    top: zone(w3, 0,   w7, h4)         > TH,
+    tl:  zone(0,  h4,  w3, h2)         > TH,
+    tr:  zone(w7, h4,  width, h2)      > TH,
+    mid: zone(w3, h2 - h4, w7, h2 + h4) > TH,
+    bl:  zone(0,  h2,  w3, h6)         > TH,
+    br:  zone(w7, h2,  width, h6)      > TH,
+    bot: zone(w3, h6,  w7, height)     > TH
+  };
+
+  // [top, tl, tr, mid, bl, br, bot]
+  const TABLE = {
+    "0": [1,1,1,0,1,1,1], "1": [0,0,1,0,0,1,0],
+    "2": [1,0,1,1,1,0,1], "3": [1,0,1,1,0,1,1],
+    "4": [0,1,1,1,0,1,0], "5": [1,1,0,1,0,1,1],
+    "6": [1,1,0,1,1,1,1], "7": [1,0,1,0,0,1,0],
+    "8": [1,1,1,1,1,1,1], "9": [1,1,1,1,0,1,1]
+  };
+  const keys = ["top","tl","tr","mid","bl","br","bot"];
+
+  let best = null, bestScore = -99;
+  for (const [d, pat] of Object.entries(TABLE)) {
+    let score = 0;
+    keys.forEach((k, i) => { score += (s[k] === (pat[i] === 1)) ? 2 : -1; });
+    if (score > bestScore) { bestScore = score; best = d; }
+  }
+  // Confidence: map [-7..14] -> [0..100]
+  const conf = Math.round(clamp((bestScore + 7) / 21 * 100, 0, 100));
+  return { digit: best, conf };
+}
+
+// ─── Segmented recognition pipeline ─────────────────────────────────────
+// Splits the OTSU-binarised strip into individual digits, then runs
+// both the 7-segment classifier AND Tesseract PSM-10 (single char)
+// on each segment.  Returns two OCR candidates: one per method.
+async function runSegmentedRecognition(otsuCanvas, worker, scanToken) {
+  if (!otsuCanvas) return [];
+
+  try {
+    const { width, height } = otsuCanvas;
+    const ctx   = otsuCanvas.getContext("2d", { willReadFrequently: true });
+    const pixels = extractGrayscalePixels(ctx.getImageData(0, 0, width, height));
+    const bounds = findDigitBoundaries(pixels, width, height);
+
+    // Sanity check: meters have 4-9 digits
+    if (bounds.length < 2 || bounds.length > 10) return [];
+
+    let text7seg = "";
+    let textPsm10 = "";
+    let confSum = 0;
+    let confCount = 0;
+
+    for (const { x, w } of bounds) {
+      if (scanToken !== scannerState.scanToken) return [];
+
+      // Extract digit sub-image
+      const dc = createCanvas(w, height);
+      dc.getContext("2d").drawImage(otsuCanvas, x, 0, w, height, 0, 0, w, height);
+      const dpx = extractGrayscalePixels(
+        dc.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, w, height)
+      );
+
+      // 7-segment zone classification
+      const { digit: d7, conf: c7 } = classify7SegDigit(dpx, w, height);
+      if (d7) text7seg += d7;
+
+      // Tesseract PSM 10 (single character)
+      try {
+        await worker.setParameters({ tessedit_pageseg_mode: 10 });
+        const r = await worker.recognize(dc);
+        const ch = normalizeOcrText(r.data?.text || "").replace(/\D/g, "").slice(0, 1);
+        if (ch) {
+          textPsm10 += ch;
+          confSum  += (r.data?.confidence || 0);
+          confCount++;
+        }
+      } catch (_e) { /* best-effort */ }
+    }
+
+    // Restore PSM 7 for subsequent full-strip passes
+    try { await worker.setParameters({ tessedit_pageseg_mode: 7 }); } catch (_e) {}
+
+    const results = [];
+    if (text7seg.length >= SCANNER_CONFIG.minDigits) {
+      results.push(createOcrCandidate({
+        engine: "tesseract",
+        variantId: "seg7",
+        label: "7-Seg",
+        rawText: text7seg,
+        confidence: 72, // pattern match has fixed reliability
+        previewCanvas: otsuCanvas
+      }));
+    }
+    if (textPsm10.length >= SCANNER_CONFIG.minDigits) {
+      results.push(createOcrCandidate({
+        engine: "tesseract",
+        variantId: "psm10",
+        label: "Per-digit",
+        rawText: textPsm10,
+        confidence: confCount > 0 ? Math.round(confSum / confCount) : 40,
+        previewCanvas: otsuCanvas
+      }));
+    }
+    return results;
+  } catch (_e) {
+    return [];
+  }
+}
+
+
 // OTSU global threshold — finds the optimal separation between
 // digit pixels and background via inter-class variance maximisation.
 // Works very well for LCD / 7-segment displays with clear contrast.
@@ -1863,16 +2032,24 @@ async function runMlEnhancedOcr(capturedCanvas, scanToken) {
       return;
     }
 
+    const otsuVariant = variants.find((v) => v.id === "otsu");
     updateCropPreview((variants.find((v) => v.id === "adaptive") || variants[0])?.canvas || null);
 
-    const tesseractResults = await runTesseractPasses(variants, scanToken);
+    // Run all passes in parallel where possible
+    const worker = await getOcrWorker();
+    setScannerMessage("Running 7-segment + per-digit + ensemble OCR...");
+
+    const [tesseractResults, segmentedResults] = await Promise.all([
+      runTesseractPasses(variants, scanToken),
+      runSegmentedRecognition(otsuVariant?.canvas || null, worker, scanToken)
+    ]);
 
     if (scanToken !== scannerState.scanToken) {
       return;
     }
 
     const fallbackResults = runFallbackOcrPass(variants);
-    const allResults = [...tesseractResults, ...fallbackResults];
+    const allResults = [...tesseractResults, ...segmentedResults, ...fallbackResults];
     const decision = chooseBestOcrResult(allResults);
     const previewCanvas =
       decision.bestCandidate?.previewCanvas ||
